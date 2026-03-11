@@ -50,5 +50,5 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
-USER node
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+# Fix ownership of mounted volume (may be root-owned from previous deploys), then drop to node
+CMD chown -R node:node /paperclip 2>/dev/null; exec su -s /bin/sh node -c 'node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js'
