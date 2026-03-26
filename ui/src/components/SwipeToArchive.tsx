@@ -23,6 +23,7 @@ export function SwipeToArchive({
   const startPointRef = useRef<{ x: number; y: number } | null>(null);
   const widthRef = useRef(0);
   const timeoutRef = useRef<number | null>(null);
+  const suppressClickRef = useRef(false);
   const [offsetX, setOffsetX] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [isCollapsing, setIsCollapsing] = useState(false);
@@ -68,6 +69,7 @@ export function SwipeToArchive({
     widthRef.current = node?.offsetWidth ?? 0;
     setLockedHeight(node?.offsetHeight ?? null);
     setIsCollapsing(false);
+    suppressClickRef.current = false;
     startPointRef.current = { x: touch.clientX, y: touch.clientY };
   };
 
@@ -86,6 +88,7 @@ export function SwipeToArchive({
         startPointRef.current = null;
         return;
       }
+      suppressClickRef.current = true;
     }
 
     if (deltaX >= 0) {
@@ -127,6 +130,12 @@ export function SwipeToArchive({
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
       onTouchCancel={handleTouchEnd}
+      onClickCapture={(event) => {
+        if (!suppressClickRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        suppressClickRef.current = false;
+      }}
     >
       <div
         aria-hidden="true"
