@@ -55,7 +55,7 @@ describe("keyboardShortcuts helpers", () => {
     })).toBe("archive");
   });
 
-  it("disarms on the first non-y keypress", () => {
+  it("ignores non-y keypresses", () => {
     const button = document.createElement("button");
 
     expect(resolveInboxQuickArchiveKeyAction({
@@ -67,7 +67,7 @@ describe("keyboardShortcuts helpers", () => {
       altKey: false,
       target: button,
       hasOpenDialog: false,
-    })).toBe("disarm");
+    })).toBe("ignore");
   });
 
   it("stays inert for modifier combos before a real keypress", () => {
@@ -96,7 +96,7 @@ describe("keyboardShortcuts helpers", () => {
     })).toBe("ignore");
   });
 
-  it("disarms instead of archiving when typing into an editor", () => {
+  it("ignores input typing instead of archiving", () => {
     const input = document.createElement("input");
 
     expect(resolveInboxQuickArchiveKeyAction({
@@ -108,7 +108,7 @@ describe("keyboardShortcuts helpers", () => {
       altKey: false,
       target: input,
       hasOpenDialog: false,
-    })).toBe("disarm");
+    })).toBe("ignore");
   });
 
   it("arms go-to-inbox on a clean g press", () => {

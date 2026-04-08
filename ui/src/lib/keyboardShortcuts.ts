@@ -47,11 +47,11 @@ export function resolveInboxQuickArchiveKeyAction({
   hasOpenDialog: boolean;
 }): InboxQuickArchiveKeyAction {
   if (!armed) return "ignore";
-  if (defaultPrevented) return "disarm";
+  if (defaultPrevented) return "ignore";
   if (metaKey || ctrlKey || altKey || isModifierOnlyKey(key)) return "ignore";
-  if (hasOpenDialog || isKeyboardShortcutTextInputTarget(target)) return "disarm";
-  if (key === "y") return "archive";
-  return "disarm";
+  if (hasOpenDialog || isKeyboardShortcutTextInputTarget(target)) return "ignore";
+  if (key.toLowerCase() === "y") return "archive";
+  return "ignore";
 }
 
 export function resolveGoToInboxKeyAction({

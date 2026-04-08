@@ -24,7 +24,6 @@ import {
   readIssueDetailLocationState,
   readIssueDetailBreadcrumb,
   rememberIssueDetailLocationState,
-  shouldArmIssueDetailInboxQuickArchive,
 } from "../lib/issueDetailBreadcrumb";
 import {
   hasBlockingShortcutDialog,
@@ -1235,46 +1234,17 @@ export function IssueDetail() {
     return () => closePanel();
   }, [closePanel, handleIssuePropertiesUpdate, issuePanelKey, openNewSubIssue, openPanel]);
 
-  const inboxQuickArchiveArmedRef = useRef(false);
   const goToInboxShortcutArmedRef = useRef(false);
   const goToInboxShortcutTimeoutRef = useRef<number | null>(null);
   const canQuickArchiveFromInbox =
     keyboardShortcutsEnabled &&
-    !issue?.hiddenAt &&
-    sourceBreadcrumb.href.startsWith("/inbox") &&
-    shouldArmIssueDetailInboxQuickArchive(location.state);
+    !issue?.hiddenAt;
 
   useEffect(() => {
-    if (!issue?.id || !canQuickArchiveFromInbox) {
-      inboxQuickArchiveArmedRef.current = false;
-      return;
-    }
-
-    inboxQuickArchiveArmedRef.current = true;
-
-    const disarm = () => {
-      inboxQuickArchiveArmedRef.current = false;
-    };
-
-    const handlePointerDown = () => {
-      disarm();
-    };
-
-    const handleFocusIn = (event: FocusEvent) => {
-      if (event.target instanceof HTMLElement && event.target !== document.body) {
-        disarm();
-      }
-    };
-
-    const handleSelectionChange = () => {
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || selection.toString().trim().length === 0) return;
-      disarm();
-    };
-
+    if (!issue?.id || !canQuickArchiveFromInbox) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       const action = resolveInboxQuickArchiveKeyAction({
-        armed: inboxQuickArchiveArmedRef.current,
+        armed: canQuickArchiveFromInbox,
         defaultPrevented: event.defaultPrevented,
         key: event.key,
         metaKey: event.metaKey,
@@ -1284,9 +1254,6 @@ export function IssueDetail() {
         hasOpenDialog: hasBlockingShortcutDialog(document),
       });
 
-      if (action === "ignore") return;
-
-      disarm();
       if (action !== "archive") return;
 
       event.preventDefault();
@@ -1295,14 +1262,8 @@ export function IssueDetail() {
       }
     };
 
-    document.addEventListener("pointerdown", handlePointerDown, true);
-    document.addEventListener("focusin", handleFocusIn, true);
-    document.addEventListener("selectionchange", handleSelectionChange);
     document.addEventListener("keydown", handleKeyDown, true);
     return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
-      document.removeEventListener("focusin", handleFocusIn, true);
-      document.removeEventListener("selectionchange", handleSelectionChange);
       document.removeEventListener("keydown", handleKeyDown, true);
     };
   }, [archiveFromInbox, canQuickArchiveFromInbox, issue?.id]);
