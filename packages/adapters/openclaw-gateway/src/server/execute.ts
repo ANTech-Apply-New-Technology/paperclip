@@ -147,10 +147,10 @@ export function resolveSessionKey(input: {
 }): string {
   const fallback = input.configuredSessionKey ?? "paperclip";
   if (input.strategy === "run") {
-    return prefixSessionKeyForAgent(`paperclip:run:${input.runId}`, input.agentId);
+    return prefixSessionKeyForAgent(`${fallback}:run:${input.runId}`, input.agentId);
   }
   if (input.strategy === "issue" && input.issueId) {
-    return prefixSessionKeyForAgent(`paperclip:issue:${input.issueId}`, input.agentId);
+    return prefixSessionKeyForAgent(`${fallback}:issue:${input.issueId}`, input.agentId);
   }
   return prefixSessionKeyForAgent(fallback, input.agentId);
 }
