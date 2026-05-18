@@ -301,13 +301,17 @@ describeEmbeddedPostgres("PATCH /api/issues/:id audit-wrapper", () => {
     // Sabotage: drop the audit table so writeIssueStatusAudit's insert throws.
     await db.execute(/*sql*/`DROP TABLE IF EXISTS "issue_status_audit" CASCADE`);
 
+    // NOTE: we PATCH to `done` (not `in_review`) here because in_review now
+    // requires a real review path (see `invalid_issue_disposition`). The
+    // fail-soft contract we want to assert is "audit table is dropped → real
+    // PATCH still returns 200", which is independent of the target status.
     const res = await request(createApp(agentActor(companyId, ownerAgentId, ownerRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ status: "in_review" });
+      .send({ status: "done" });
 
     // The real PATCH MUST still complete successfully.
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.status).toBe("in_review");
+    expect(res.body.status).toBe("done");
 
     // Recreate the audit table for the next afterEach() cleanup. The simplest
     // path is to re-apply the migration SQL fragment in-place. We use a minimal

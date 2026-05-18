@@ -2823,13 +2823,26 @@ export function issueRoutes(
     const auditRequestedStatus =
       typeof req.body?.status === "string" ? (req.body.status as string) : existing.status;
 
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
-      // assertAgentIssueMutationAllowed sets res.status(409) for in_progress
-      // ownership conflicts. Audit only the conflict_409 case here; 403 paths
-      // (e.g. "Agent cannot mutate another agent's issue") are intentionally
-      // skipped per Sigge ANT-958 Q4 — only {ok, conflict_409, validation_error,
-      // other_error} are persisted to issue_status_audit.
-      if (res.statusCode === 409) {
+    // ANT-810 / PCP-810: pre-detect the in_progress peer-conflict path so the
+    // audit row commits BEFORE we flush the 409 response. If we let
+    // `assertAgentIssueMutationAllowed` call `res.status(409).json(...)` first,
+    // supertest's request promise resolves on `res.end()` and a subsequent
+    // `SELECT FROM issue_status_audit` can race the still-pending insert. By
+    // writing the audit (await) and only then responding, callers (and tests)
+    // see a consistent post-response read.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId !== null &&
+      existing.assigneeAgentId !== req.actor.agentId &&
+      existing.status === "in_progress"
+    ) {
+      const overridden = await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        existing.companyId,
+        existing.assigneeAgentId,
+      );
+      if (!overridden) {
         await writeIssueStatusAudit(db, {
           ...auditSnapshot,
           afterStatus: auditRequestedStatus,
@@ -2837,7 +2850,23 @@ export function issueRoutes(
           errorCode: "ownership_conflict",
           errorMessage: "Issue is checked out by another agent",
         });
+        res.status(409).json({
+          error: "Issue is checked out by another agent",
+          details: {
+            issueId: existing.id,
+            assigneeAgentId: existing.assigneeAgentId,
+            actorAgentId: req.actor.agentId,
+          },
+        });
+        return;
       }
+    }
+
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
+      // 403 paths (non-in_progress peer, missing agent id) are intentionally
+      // skipped per Sigge ANT-958 Q4 — only {ok, conflict_409, validation_error,
+      // other_error} are persisted to issue_status_audit. The in_progress 409
+      // case was already handled above before the response was flushed.
       return;
     }
 
