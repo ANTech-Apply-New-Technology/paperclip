@@ -502,12 +502,17 @@ describe("openclaw gateway adapter execute", () => {
       );
       expect(String(payload?.message ?? "")).toContain("First comment");
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
-      expect(payload?.paperclip).toMatchObject({
-        wake: {
-          latestCommentId: "comment-2",
-          commentIds: ["comment-1", "comment-2"],
-        },
-      });
+      // ANT fork: paperclip metadata is delivered inside the message string
+      // (the structured JSON code fence), not as a top-level agentParams.paperclip,
+      // because the OpenClaw Gateway rejects unknown root properties.
+      // See commits 6c9e639a / 4af590cf / 7518696c.
+      expect(payload?.paperclip).toBeUndefined();
+      {
+        const messageText = String(payload?.message ?? "");
+        expect(messageText).toContain("Structured wake payload JSON:");
+        expect(messageText).toContain("\"latestCommentId\":\"comment-2\"");
+        expect(messageText).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
+      }
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
     } finally {
