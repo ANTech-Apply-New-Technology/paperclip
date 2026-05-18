@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { getLatestAuditForRun } from "./issue-status-audit.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -132,11 +133,31 @@ export function continuationSummaryParksExecutor(body: string | null | undefined
   return WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(nextAction);
 }
 
+/**
+ * Optional, pre-fetched audit snapshot used to override the LLM-narrated
+ * Status line with server-of-record evidence. See `refreshIssueContinuationSummary`
+ * for the on-write callers; tests and direct callers may pass `null`.
+ *
+ * Sigge ANT-810 acceptance: continuation-summary must not narrate `done` when
+ * the actual server-of-record status disagrees. Audit row (if present) wins
+ * over the run-side narrative.
+ */
+export type ContinuationStatusAuditSnapshot = {
+  afterStatus: string;
+  outcome: string;
+  errorMessage: string | null;
+  createdAt: Date;
+};
+
 export function buildContinuationSummaryMarkdown(input: {
   issue: IssueSummaryInput;
   run: RunSummaryInput;
   agent: AgentSummaryInput;
   previousSummaryBody?: string | null;
+  /** Latest issue_status_audit row for THIS run, or null if none was written. */
+  latestStatusAudit?: ContinuationStatusAuditSnapshot | null;
+  /** issues.updated_at at render time (server-of-record). */
+  issueUpdatedAt?: Date | null;
 }) {
   const { issue, run, agent } = input;
   const resultSummary = readResultSummary(run.resultJson);
@@ -158,7 +179,13 @@ export function buildContinuationSummaryMarkdown(input: {
     "# Continuation Summary",
     "",
     `- Issue: ${issue.identifier ?? issue.id} — ${issue.title}`,
-    `- Status: ${issue.status}`,
+    // PCP-810: anchor Status line to issues.status (server-of-record). When a
+    // matching audit row exists for THIS run, append the attempted-PATCH
+    // outcome so reviewers see what the run actually tried. The audit-derived
+    // suffix takes precedence over any LLM narrative further down in the body.
+    input.latestStatusAudit
+      ? `- Status: ${issue.status} (server-of-record; run \`${run.id}\` last PATCH attempt: ${input.latestStatusAudit.afterStatus} → outcome=${input.latestStatusAudit.outcome}${input.latestStatusAudit.errorMessage ? ` (${truncateText(input.latestStatusAudit.errorMessage, 200)})` : ""}; issue.updated_at=${(input.issueUpdatedAt ?? new Date()).toISOString()})`
+      : `- Status: ${issue.status} (server-of-record; no PATCH attempt logged this run; issue.updated_at=${(input.issueUpdatedAt ?? new Date()).toISOString()})`,
     `- Priority: ${issue.priority}`,
     `- Current mode: ${mode}`,
     `- Last updated by run: ${run.id}`,
@@ -243,7 +270,11 @@ export async function refreshIssueContinuationSummary(input: {
   agent: AgentSummaryInput;
 }) {
   const { db, issueId, run, agent } = input;
-  const [issue, existing] = await Promise.all([
+  // PCP-810: pre-fetch the matching audit row + issues.updated_at so the
+  // build function can render the server-of-record Status line. Audit fetch
+  // is fail-soft: if it throws we fall back to a null snapshot and a warning
+  // hint in the rendered text (no Status line crash).
+  const [issue, existing, latestStatusAudit] = await Promise.all([
     db
       .select({
         id: issues.id,
@@ -252,19 +283,31 @@ export async function refreshIssueContinuationSummary(input: {
         description: issues.description,
         status: issues.status,
         priority: issues.priority,
+        updatedAt: issues.updatedAt,
       })
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null),
     getIssueContinuationSummaryDocument(db, issueId),
+    getLatestAuditForRun(db, issueId, run.id).catch(() => null),
   ]);
 
   if (!issue) return null;
+  const auditSnapshot: ContinuationStatusAuditSnapshot | null = latestStatusAudit
+    ? {
+        afterStatus: latestStatusAudit.afterStatus,
+        outcome: latestStatusAudit.outcome,
+        errorMessage: latestStatusAudit.errorMessage,
+        createdAt: latestStatusAudit.createdAt,
+      }
+    : null;
   const body = buildContinuationSummaryMarkdown({
     issue,
     run,
     agent,
     previousSummaryBody: existing?.body ?? null,
+    latestStatusAudit: auditSnapshot,
+    issueUpdatedAt: issue.updatedAt,
   });
   const result = await documentService(db).upsertIssueDocument({
     issueId,

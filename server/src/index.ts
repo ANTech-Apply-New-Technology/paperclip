@@ -38,6 +38,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { startIssueStatusAuditRetention } from "./services/issue-status-audit.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -802,7 +803,15 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  // PCP-810: in-process retention sweep for issue_status_audit. Runs once
+  // immediately, then every 24h (defaults from services/issue-status-audit.ts).
+  // Idempotent — safe if multiple processes share the database; safe across
+  // restarts. We intentionally do not expose the stop-fn on StartedServer for
+  // Fas 1a; Node clears the interval on process exit, and the writer is
+  // fail-soft so a draining DB during shutdown cannot 500 anything.
+  void startIssueStatusAuditRetention(db as any);
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.

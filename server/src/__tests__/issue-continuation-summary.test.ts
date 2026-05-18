@@ -112,4 +112,68 @@ describe("issue continuation summaries", () => {
 
     expect(continuationSummaryParksExecutor(body)).toBe(false);
   });
+
+  it("renders a no-audit Status line as server-of-record without a PATCH attempt", () => {
+    // PCP-810: when no audit row exists for this run, the Status line should
+    // still anchor to issues.status + updated_at so reviewers can verify the
+    // freshness, but explicitly tag "no PATCH attempt logged this run" so
+    // LLM continuation prose cannot fake a done.
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "ANT-960",
+        title: "Audit override smoke",
+        description: null,
+        status: "in_progress",
+        priority: "high",
+      },
+      run: {
+        id: "run-x",
+        status: "succeeded",
+        error: null,
+        resultJson: null,
+      },
+      agent: { id: "agent-1", name: "Koda", adapterType: "openclaw_gateway" },
+      latestStatusAudit: null,
+      issueUpdatedAt: new Date("2026-05-18T17:00:00.000Z"),
+    });
+    expect(body).toContain("- Status: in_progress (server-of-record;");
+    expect(body).toContain("no PATCH attempt logged this run");
+    expect(body).toContain("issue.updated_at=2026-05-18T17:00:00.000Z");
+  });
+
+  it("overrides the Status line with the audit row even when a run claims success", () => {
+    // PCP-810 acceptance: audit row wins over LLM narrative. Here the run
+    // "finished" successfully but the run's PATCH attempt was rejected with
+    // conflict_409 — the Status line must surface the conflict so reviewers
+    // know the run did NOT actually move the issue to `done`.
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1",
+        identifier: "ANT-960",
+        title: "Audit override conflict",
+        description: null,
+        status: "in_progress",
+        priority: "high",
+      },
+      run: {
+        id: "run-y",
+        status: "succeeded",
+        error: null,
+        resultJson: { summary: "Marked the issue as done." },
+      },
+      agent: { id: "agent-1", name: "Koda", adapterType: "openclaw_gateway" },
+      latestStatusAudit: {
+        afterStatus: "done",
+        outcome: "conflict_409",
+        errorMessage: "Issue is checked out by another agent",
+        createdAt: new Date("2026-05-18T17:10:00.000Z"),
+      },
+      issueUpdatedAt: new Date("2026-05-18T16:00:00.000Z"),
+    });
+    expect(body).toContain(
+      "- Status: in_progress (server-of-record; run `run-y` last PATCH attempt: done → outcome=conflict_409",
+    );
+    expect(body).toContain("Issue is checked out by another agent");
+  });
 });

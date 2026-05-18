@@ -75,6 +75,10 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import {
+  writeIssueStatusAudit,
+  type AuditOutcome,
+} from "../services/issue-status-audit.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -2800,7 +2804,71 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+
+    // ANT-810 / PCP-810 audit snapshot — taken BEFORE any guard/mutation so the
+    // audit row reflects what the run actually attempted, even if the mutation
+    // never reaches svc.update. `actorRunId` is parsed from the
+    // `X-Paperclip-Run-Id` header by `getActorInfo`. The audit writer is
+    // fail-soft (`writeIssueStatusAudit` never throws), so a broken audit
+    // pipeline cannot 500 the real PATCH response.
+    const _auditActor = getActorInfo(req);
+    const auditSnapshot = {
+      issueId: id,
+      actorAgentId: _auditActor.agentId ?? null,
+      actorRunId: _auditActor.runId ?? null,
+      checkoutRunId: existing.checkoutRunId ?? null,
+      executionRunId: existing.executionRunId ?? null,
+      beforeStatus: existing.status,
+    } as const;
+    const auditRequestedStatus =
+      typeof req.body?.status === "string" ? (req.body.status as string) : existing.status;
+
+    // ANT-810 / PCP-810: pre-detect the in_progress peer-conflict path so the
+    // audit row commits BEFORE we flush the 409 response. If we let
+    // `assertAgentIssueMutationAllowed` call `res.status(409).json(...)` first,
+    // supertest's request promise resolves on `res.end()` and a subsequent
+    // `SELECT FROM issue_status_audit` can race the still-pending insert. By
+    // writing the audit (await) and only then responding, callers (and tests)
+    // see a consistent post-response read.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId !== null &&
+      existing.assigneeAgentId !== req.actor.agentId &&
+      existing.status === "in_progress"
+    ) {
+      const overridden = await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        existing.companyId,
+        existing.assigneeAgentId,
+      );
+      if (!overridden) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: auditRequestedStatus,
+          outcome: "conflict_409",
+          errorCode: "ownership_conflict",
+          errorMessage: "Issue is checked out by another agent",
+        });
+        res.status(409).json({
+          error: "Issue is checked out by another agent",
+          details: {
+            issueId: existing.id,
+            assigneeAgentId: existing.assigneeAgentId,
+            actorAgentId: req.actor.agentId,
+          },
+        });
+        return;
+      }
+    }
+
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
+      // 403 paths (non-in_progress peer, missing agent id) are intentionally
+      // skipped per Sigge ANT-958 Q4 — only {ok, conflict_409, validation_error,
+      // other_error} are persisted to issue_status_audit. The in_progress 409
+      // case was already handled above before the response was flushed.
+      return;
+    }
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
@@ -3060,12 +3128,55 @@ export function issueRoutes(
           "issue update rejected with 422",
         );
       }
+      // ANT-810 / PCP-810 audit: error path. Map HttpError status to outcome.
+      // 403 is intentionally skipped (Sigge ANT-958 Q4); everything else falls
+      // back to `other_error`. Audit BEFORE re-throw so a downstream handler
+      // crash cannot lose the attempt.
+      let outcome: AuditOutcome | null = null;
+      let errorCode: string | null = null;
+      if (err instanceof HttpError) {
+        if (err.status === 409) {
+          outcome = "conflict_409";
+          errorCode = "http_409";
+        } else if (err.status === 400 || err.status === 422) {
+          outcome = "validation_error";
+          errorCode = `http_${err.status}`;
+        } else if (err.status === 403) {
+          // skip — not persisted per Sigge ANT-958 Q4
+        } else {
+          outcome = "other_error";
+          errorCode = `http_${err.status}`;
+        }
+      } else {
+        outcome = "other_error";
+        errorCode = "unexpected_error";
+      }
+      if (outcome) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: auditRequestedStatus,
+          outcome,
+          errorCode,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
       throw err;
     }
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+
+    // ANT-810 / PCP-810 audit: success path. We log the actual post-update
+    // status (`issue.status`) — not just the requested status — so the audit
+    // row reflects what the server actually persisted. Fail-soft writer.
+    await writeIssueStatusAudit(db, {
+      ...auditSnapshot,
+      afterStatus: issue.status,
+      outcome: "ok",
+      errorCode: null,
+      errorMessage: null,
+    });
 
     let cancelledStatusRunId: string | null = null;
     if (runToCancelForCancelledStatus) {
@@ -3733,8 +3844,105 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+
+    // PCP-810 ANT-810 step 4: validate forceRelease before passing to the
+    // service. Sigge ANT-958 Q3 (b): UUID equality on executionAgentId, not
+    // the freeform executionAgentNameKey text.
+    const forceReleaseRequested = req.body.forceRelease === true;
+    if (forceReleaseRequested) {
+      if (req.actor.type !== "agent" || !req.actor.agentId) {
+        res.status(403).json({ error: "forceRelease requires an agent actor" });
+        return;
+      }
+      if (issue.executionAgentId && issue.executionAgentId === req.actor.agentId) {
+        res.status(403).json({
+          error: "forceRelease cannot break an actor's own lock",
+          details: { issueId: issue.id, executionAgentId: issue.executionAgentId },
+        });
+        return;
+      }
+      if (issue.executionAgentId) {
+        const allowed = await hasActiveCheckoutManagementOverride(
+          req.actor.agentId,
+          issue.companyId,
+          issue.executionAgentId,
+        );
+        if (!allowed) {
+          res.status(403).json({
+            error: "forceRelease requires tasks:manage_active_checkouts override",
+            details: { issueId: issue.id },
+          });
+          return;
+        }
+      }
+    }
+
+    // Pre-snapshot for audit. Service decides whether the call is a fresh
+    // take, an adopt, a stale-lock handoff, or a forced takeover; the route
+    // detects handoff by diffing the pre/post executionRunId.
+    const auditSnapshot = {
+      issueId: issue.id,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      actorRunId: checkoutRunId,
+      checkoutRunId: issue.checkoutRunId ?? null,
+      executionRunId: issue.executionRunId ?? null,
+      beforeStatus: issue.status,
+    } as const;
+    const prevExecutionRunId = issue.executionRunId;
+
+    let updated;
+    try {
+      updated = await svc.checkout(
+        id,
+        req.body.agentId,
+        req.body.expectedStatuses,
+        checkoutRunId,
+        { forceRelease: forceReleaseRequested },
+      );
+    } catch (err) {
+      // PCP-810: log conflict_409 / validation_error audit rows even for the
+      // checkout endpoint, so a denied takeover attempt leaves a trace.
+      let outcome: AuditOutcome | null = null;
+      let errorCode: string | null = null;
+      if (err instanceof HttpError) {
+        if (err.status === 409) { outcome = "conflict_409"; errorCode = "checkout_conflict"; }
+        else if (err.status === 400 || err.status === 422) { outcome = "validation_error"; errorCode = `http_${err.status}`; }
+        else if (err.status === 403) { /* skip per Q4 */ }
+        else { outcome = "other_error"; errorCode = `http_${err.status}`; }
+      } else {
+        outcome = "other_error";
+        errorCode = "unexpected_error";
+      }
+      if (outcome) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: "in_progress",
+          outcome,
+          errorCode,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
+    }
     const actor = getActorInfo(req);
+
+    // PCP-810: detect handoff (lock changed hands mid-checkout) for the audit
+    // errorMessage tag — useful to differentiate fresh takes from forced /
+    // stale takeovers when reading audit rows post-incident.
+    const handoffReason =
+      forceReleaseRequested && prevExecutionRunId && prevExecutionRunId !== checkoutRunId
+        ? `force_release prev_run=${prevExecutionRunId}`
+        : prevExecutionRunId && prevExecutionRunId !== checkoutRunId
+        ? `stale_lock_handoff prev_run=${prevExecutionRunId}`
+        : null;
+
+    await writeIssueStatusAudit(db, {
+      ...auditSnapshot,
+      afterStatus: updated?.status ?? "in_progress",
+      outcome: "ok",
+      errorCode: null,
+      errorMessage: handoffReason,
+    });
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -3745,7 +3953,7 @@ export function issueRoutes(
       action: "issue.checked_out",
       entityType: "issue",
       entityId: issue.id,
-      details: { agentId: req.body.agentId },
+      details: { agentId: req.body.agentId, handoff: handoffReason },
     });
 
     if (
