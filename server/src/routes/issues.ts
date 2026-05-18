@@ -74,6 +74,8 @@ import {
   projectService,
   routineService,
   workProductService,
+  writeIssueStatusAudit,
+  type AuditOutcome,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
@@ -2800,7 +2802,42 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+
+    // ANT-810 / PCP-810 audit snapshot — taken BEFORE any guard/mutation so the
+    // audit row reflects what the run actually attempted, even if the mutation
+    // never reaches svc.update. `actorRunId` is parsed from the
+    // `X-Paperclip-Run-Id` header by `getActorInfo`. The audit writer is
+    // fail-soft (`writeIssueStatusAudit` never throws), so a broken audit
+    // pipeline cannot 500 the real PATCH response.
+    const _auditActor = getActorInfo(req);
+    const auditSnapshot = {
+      issueId: id,
+      actorAgentId: _auditActor.agentId ?? null,
+      actorRunId: _auditActor.runId ?? null,
+      checkoutRunId: existing.checkoutRunId ?? null,
+      executionRunId: existing.executionRunId ?? null,
+      beforeStatus: existing.status,
+    } as const;
+    const auditRequestedStatus =
+      typeof req.body?.status === "string" ? (req.body.status as string) : existing.status;
+
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) {
+      // assertAgentIssueMutationAllowed sets res.status(409) for in_progress
+      // ownership conflicts. Audit only the conflict_409 case here; 403 paths
+      // (e.g. "Agent cannot mutate another agent's issue") are intentionally
+      // skipped per Sigge ANT-958 Q4 — only {ok, conflict_409, validation_error,
+      // other_error} are persisted to issue_status_audit.
+      if (res.statusCode === 409) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: auditRequestedStatus,
+          outcome: "conflict_409",
+          errorCode: "ownership_conflict",
+          errorMessage: "Issue is checked out by another agent",
+        });
+      }
+      return;
+    }
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
@@ -3060,12 +3097,55 @@ export function issueRoutes(
           "issue update rejected with 422",
         );
       }
+      // ANT-810 / PCP-810 audit: error path. Map HttpError status to outcome.
+      // 403 is intentionally skipped (Sigge ANT-958 Q4); everything else falls
+      // back to `other_error`. Audit BEFORE re-throw so a downstream handler
+      // crash cannot lose the attempt.
+      let outcome: AuditOutcome | null = null;
+      let errorCode: string | null = null;
+      if (err instanceof HttpError) {
+        if (err.status === 409) {
+          outcome = "conflict_409";
+          errorCode = "http_409";
+        } else if (err.status === 400 || err.status === 422) {
+          outcome = "validation_error";
+          errorCode = `http_${err.status}`;
+        } else if (err.status === 403) {
+          // skip — not persisted per Sigge ANT-958 Q4
+        } else {
+          outcome = "other_error";
+          errorCode = `http_${err.status}`;
+        }
+      } else {
+        outcome = "other_error";
+        errorCode = "unexpected_error";
+      }
+      if (outcome) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: auditRequestedStatus,
+          outcome,
+          errorCode,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
       throw err;
     }
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
+
+    // ANT-810 / PCP-810 audit: success path. We log the actual post-update
+    // status (`issue.status`) — not just the requested status — so the audit
+    // row reflects what the server actually persisted. Fail-soft writer.
+    await writeIssueStatusAudit(db, {
+      ...auditSnapshot,
+      afterStatus: issue.status,
+      outcome: "ok",
+      errorCode: null,
+      errorMessage: null,
+    });
 
     let cancelledStatusRunId: string | null = null;
     if (runToCancelForCancelledStatus) {
