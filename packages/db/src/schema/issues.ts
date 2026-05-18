@@ -37,6 +37,11 @@ export const issues = pgTable(
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionAgentNameKey: text("execution_agent_name_key"),
+    // UUID of the agent that owns the active execution lock. Populated alongside
+    // executionRunId / executionLockedAt and used by forceRelease ownership checks
+    // (an agent cannot force-release its own lock). Nullable because legacy rows
+    // exist without this column; soft-delete on agents (no FK).
+    executionAgentId: uuid("execution_agent_id"),
     executionLockedAt: timestamp("execution_locked_at", { withTimezone: true }),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id),
     createdByUserId: text("created_by_user_id"),
