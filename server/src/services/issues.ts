@@ -1561,6 +1561,7 @@ const issueListSelect = {
   checkoutRunId: issues.checkoutRunId,
   executionRunId: issues.executionRunId,
   executionAgentNameKey: issues.executionAgentNameKey,
+  executionAgentId: issues.executionAgentId,
   executionLockedAt: issues.executionLockedAt,
   createdByAgentId: issues.createdByAgentId,
   createdByUserId: issues.createdByUserId,
