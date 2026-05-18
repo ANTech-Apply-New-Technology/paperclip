@@ -3269,6 +3269,7 @@ export function issueService(db: Db) {
       .set({
         checkoutRunId: input.actorRunId,
         executionRunId: input.actorRunId,
+        executionAgentId: input.actorAgentId,
         executionLockedAt: now,
         updatedAt: now,
       })
@@ -3303,6 +3304,7 @@ export function issueService(db: Db) {
       .set({
         checkoutRunId: input.actorRunId,
         executionRunId: input.actorRunId,
+        executionAgentId: input.actorAgentId,
         executionLockedAt: now,
         updatedAt: now,
       })
@@ -3354,6 +3356,7 @@ export function issueService(db: Db) {
         .set({
           executionRunId: null,
           executionAgentNameKey: null,
+          executionAgentId: null,
           executionLockedAt: null,
           updatedAt: new Date(),
         })
@@ -4573,7 +4576,13 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
-    checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
+    checkout: async (
+      id: string,
+      agentId: string,
+      expectedStatuses: string[],
+      checkoutRunId: string | null,
+      opts: { forceRelease?: boolean } = {},
+    ) => {
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -4621,6 +4630,12 @@ export function issueService(db: Db) {
           assigneeUserId: null,
           checkoutRunId,
           executionRunId: checkoutRunId,
+          // PCP-810: populate executionAgentId / executionLockedAt on take so
+          // the 15-min lock-age policy and forceRelease ownership comparison
+          // (Sigge ANT-958 Q3 (b): UUID equality on executionAgentId) have a
+          // server-of-record source.
+          executionAgentId: agentId,
+          executionLockedAt: now,
           status: "in_progress",
           startedAt: now,
           updatedAt: now,
@@ -4716,12 +4731,70 @@ export function issueService(db: Db) {
         return enriched;
       }
 
+      // PCP-810 ANT-810: 15-min lock-age / forceRelease handoff.
+      //
+      // If the current lock has aged past STALE_LOCK_AGE_MS without the owning
+      // run releasing it, OR the caller explicitly invoked `forceRelease`
+      // (route-layer already validated the override permission and that
+      // `actorAgentId !== executionAgentId`), take the lock and return the
+      // fresh row. This is the documented escape hatch for ANT-805 H1
+      // (dead-lock from a crashed/timed-out heartbeat).
+      const STALE_LOCK_AGE_MS = 15 * 60 * 1000;
+      if (checkoutRunId) {
+        const fullCurrent = await db
+          .select({
+            executionLockedAt: issues.executionLockedAt,
+            executionAgentId: issues.executionAgentId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        const lockedAt = fullCurrent?.executionLockedAt ?? null;
+        const ageMs = lockedAt ? Date.now() - new Date(lockedAt).getTime() : null;
+        const isStale = ageMs !== null && ageMs >= STALE_LOCK_AGE_MS;
+        if (opts.forceRelease === true || isStale) {
+          const handoffNow = new Date();
+          const prevExecutionRunId = current.executionRunId;
+          if (!prevExecutionRunId) {
+            // No lock to take over — fall through to the conflict throw below
+            // so we don't accidentally hijack a row that's mid-clearing.
+          } else {
+            const taken = await db
+              .update(issues)
+              .set({
+                assigneeAgentId: agentId,
+                assigneeUserId: null,
+                checkoutRunId,
+                executionRunId: checkoutRunId,
+                executionAgentId: agentId,
+                executionLockedAt: handoffNow,
+                status: "in_progress",
+                startedAt: handoffNow,
+                updatedAt: handoffNow,
+              })
+              .where(
+                and(
+                  eq(issues.id, id),
+                  eq(issues.executionRunId, prevExecutionRunId),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (taken) {
+              const [enriched] = await withIssueLabels(db, [taken]);
+              return enriched;
+            }
+          }
+        }
+      }
+
       throw conflict("Issue checkout conflict", {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        executionAgentId: undefined,
       });
     },
 
@@ -4841,6 +4914,7 @@ export function issueService(db: Db) {
           checkoutRunId: null,
           executionRunId: null,
           executionAgentNameKey: null,
+          executionAgentId: null,
           executionLockedAt: null,
           updatedAt: new Date(),
         })
@@ -4872,6 +4946,7 @@ export function issueService(db: Db) {
           checkoutRunId: null,
           executionRunId: null,
           executionAgentNameKey: null,
+          executionAgentId: null,
           executionLockedAt: null,
           updatedAt: new Date(),
         };

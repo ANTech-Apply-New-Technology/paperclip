@@ -432,6 +432,13 @@ export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorks
 export const checkoutIssueSchema = z.object({
   agentId: z.string().uuid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
+  /**
+   * PCP-810: when true, requesting agent has overrideable checkout-management
+   * permissions over the current lock-owner AND their agentId differs from
+   * the issue's executionAgentId. Used to break a live (<15 min) lock
+   * voluntarily. Server-side validation in routes/issues.ts.
+   */
+  forceRelease: z.boolean().optional(),
 });
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;

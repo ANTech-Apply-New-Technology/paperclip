@@ -3813,8 +3813,105 @@ export function issueRoutes(
 
     const checkoutRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !checkoutRunId) return;
-    const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
+
+    // PCP-810 ANT-810 step 4: validate forceRelease before passing to the
+    // service. Sigge ANT-958 Q3 (b): UUID equality on executionAgentId, not
+    // the freeform executionAgentNameKey text.
+    const forceReleaseRequested = req.body.forceRelease === true;
+    if (forceReleaseRequested) {
+      if (req.actor.type !== "agent" || !req.actor.agentId) {
+        res.status(403).json({ error: "forceRelease requires an agent actor" });
+        return;
+      }
+      if (issue.executionAgentId && issue.executionAgentId === req.actor.agentId) {
+        res.status(403).json({
+          error: "forceRelease cannot break an actor's own lock",
+          details: { issueId: issue.id, executionAgentId: issue.executionAgentId },
+        });
+        return;
+      }
+      if (issue.executionAgentId) {
+        const allowed = await hasActiveCheckoutManagementOverride(
+          req.actor.agentId,
+          issue.companyId,
+          issue.executionAgentId,
+        );
+        if (!allowed) {
+          res.status(403).json({
+            error: "forceRelease requires tasks:manage_active_checkouts override",
+            details: { issueId: issue.id },
+          });
+          return;
+        }
+      }
+    }
+
+    // Pre-snapshot for audit. Service decides whether the call is a fresh
+    // take, an adopt, a stale-lock handoff, or a forced takeover; the route
+    // detects handoff by diffing the pre/post executionRunId.
+    const auditSnapshot = {
+      issueId: issue.id,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      actorRunId: checkoutRunId,
+      checkoutRunId: issue.checkoutRunId ?? null,
+      executionRunId: issue.executionRunId ?? null,
+      beforeStatus: issue.status,
+    } as const;
+    const prevExecutionRunId = issue.executionRunId;
+
+    let updated;
+    try {
+      updated = await svc.checkout(
+        id,
+        req.body.agentId,
+        req.body.expectedStatuses,
+        checkoutRunId,
+        { forceRelease: forceReleaseRequested },
+      );
+    } catch (err) {
+      // PCP-810: log conflict_409 / validation_error audit rows even for the
+      // checkout endpoint, so a denied takeover attempt leaves a trace.
+      let outcome: AuditOutcome | null = null;
+      let errorCode: string | null = null;
+      if (err instanceof HttpError) {
+        if (err.status === 409) { outcome = "conflict_409"; errorCode = "checkout_conflict"; }
+        else if (err.status === 400 || err.status === 422) { outcome = "validation_error"; errorCode = `http_${err.status}`; }
+        else if (err.status === 403) { /* skip per Q4 */ }
+        else { outcome = "other_error"; errorCode = `http_${err.status}`; }
+      } else {
+        outcome = "other_error";
+        errorCode = "unexpected_error";
+      }
+      if (outcome) {
+        await writeIssueStatusAudit(db, {
+          ...auditSnapshot,
+          afterStatus: "in_progress",
+          outcome,
+          errorCode,
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+      throw err;
+    }
     const actor = getActorInfo(req);
+
+    // PCP-810: detect handoff (lock changed hands mid-checkout) for the audit
+    // errorMessage tag — useful to differentiate fresh takes from forced /
+    // stale takeovers when reading audit rows post-incident.
+    const handoffReason =
+      forceReleaseRequested && prevExecutionRunId && prevExecutionRunId !== checkoutRunId
+        ? `force_release prev_run=${prevExecutionRunId}`
+        : prevExecutionRunId && prevExecutionRunId !== checkoutRunId
+        ? `stale_lock_handoff prev_run=${prevExecutionRunId}`
+        : null;
+
+    await writeIssueStatusAudit(db, {
+      ...auditSnapshot,
+      afterStatus: updated?.status ?? "in_progress",
+      outcome: "ok",
+      errorCode: null,
+      errorMessage: handoffReason,
+    });
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -3825,7 +3922,7 @@ export function issueRoutes(
       action: "issue.checked_out",
       entityType: "issue",
       entityId: issue.id,
-      details: { agentId: req.body.agentId },
+      details: { agentId: req.body.agentId, handoff: handoffReason },
     });
 
     if (
