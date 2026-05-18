@@ -502,12 +502,8 @@ describe("openclaw gateway adapter execute", () => {
       );
       expect(String(payload?.message ?? "")).toContain("First comment");
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
-      expect(payload?.paperclip).toMatchObject({
-        wake: {
-          latestCommentId: "comment-2",
-          commentIds: ["comment-1", "comment-2"],
-        },
-      });
+      expect(String(payload?.message ?? "")).toMatch(/```json[\s\S]*?"latestCommentId"\s*:\s*"comment-2"[\s\S]*?```/);
+      expect(String(payload?.message ?? "")).toMatch(/```json[\s\S]*?"commentIds"\s*:\s*\[\s*"comment-1"\s*,\s*"comment-2"\s*\][\s\S]*?```/);
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
     } finally {
