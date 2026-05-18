@@ -74,9 +74,11 @@ import {
   projectService,
   routineService,
   workProductService,
+} from "../services/index.js";
+import {
   writeIssueStatusAudit,
   type AuditOutcome,
-} from "../services/index.js";
+} from "../services/issue-status-audit.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
