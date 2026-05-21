@@ -247,6 +247,9 @@ describe.sequential("issue comment auth split (ANT-1076)", () => {
     vi.clearAllMocks();
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.list.mockResolvedValue([]);
+    mockAgentService.getById.mockResolvedValue(null);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: null });
     mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getDependencyReadiness.mockResolvedValue({

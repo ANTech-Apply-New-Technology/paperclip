@@ -1162,6 +1162,29 @@ export function issueRoutes(
     return false;
   }
 
+  // ANT-1076 (Option 1): comments are read-write for any same-company agent.
+  // Cross-company access is already blocked by `assertCompanyAccess`. The
+  // mutation gates (status, blockedBy, plan/approval, structured fields,
+  // reopen/resume, interrupt) remain intact and run AFTER this helper for the
+  // POST /issues/:id/comments handler — see `assertStructuredCommentFieldsAllowed`,
+  // `assertExplicitResumeIntentAllowed`, and the board-only interrupt check.
+  //
+  // The `_issue` argument is retained for signature symmetry with
+  // `assertAgentIssueMutationAllowed` so future per-issue comment policy can
+  // be added without touching call sites.
+  function assertAgentIssueCommentAllowed(
+    req: Request,
+    res: Response,
+    _issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    if (!req.actor.agentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    return true;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -4583,7 +4606,11 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // ANT-1076 (Option 1): comments use a dedicated, looser gate. Mutation
+    // surfaces (reopen/resume, interrupt, structured fields) keep their own
+    // checks below — see `assertExplicitResumeIntentAllowed`, the board-only
+    // interrupt branch, and `assertStructuredCommentFieldsAllowed`.
+    if (!assertAgentIssueCommentAllowed(req, res, issue)) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
