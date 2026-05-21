@@ -499,7 +499,12 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
-  it("rejects non-assignee agent POST comments on closed issues", async () => {
+  it("allows non-assignee same-company agent POST bare comments on closed issues (ANT-1076 case 1)", async () => {
+    // ANT-1076 (Option 1): comments are read-write for any same-company agent.
+    // A bare comment ("body" only, no reopen/resume/interrupt) on a done issue
+    // by a non-assignee agent must succeed. Status mutation (implicit reopen)
+    // is gated by `shouldImplicitlyMoveCommentedIssueToTodo`, which only fires
+    // for user actors, so the issue stays `done`.
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-1",
@@ -522,10 +527,9 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "hello" });
 
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     expect(mockIssueService.update).not.toHaveBeenCalled();
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 

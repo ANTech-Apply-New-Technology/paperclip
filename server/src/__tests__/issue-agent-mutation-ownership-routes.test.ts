@@ -364,7 +364,6 @@ describe("agent issue mutation checkout ownership", () => {
   it.each([
     ["patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked" })],
     ["delete", (app: express.Express) => request(app).delete(`/api/issues/${issueId}`)],
-    ["comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "blocked" })],
     [
       "document upsert",
       (app: express.Express) =>
@@ -445,7 +444,6 @@ describe("agent issue mutation checkout ownership", () => {
 
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
-    ["todo", "comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Todo noise" })],
     ["blocked", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked update" })],
   ])("rejects peer agent %s issue %s mutations outside active checkout ownership", async (status, _kind, sendRequest) => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: status as "todo" | "blocked", assigneeAgentId: ownerAgentId }));
