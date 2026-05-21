@@ -1162,6 +1162,30 @@ export function issueRoutes(
     return false;
   }
 
+  // ANT-1076 (Option 1): comments are read-write for any agent in the SAME
+  // company. Status / blockedBy / plan / approval / document / attachment /
+  // work-product mutations remain restricted to the assignee (handled by
+  // `assertAgentIssueMutationAllowed`). The same-company guarantee is provided
+  // by the preceding `assertCompanyAccess(req, issue.companyId)` call at the
+  // route level — see POST /issues/:id/comments. DELETE /comments/:commentId
+  // is intentionally NOT relaxed (Sigge: destructive op stays strict).
+  function assertAgentIssueCommentAllowed(
+    req: Request,
+    res: Response,
+    _issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    // No assignee restriction. No checkout-ownership restriction.
+    // Same-company tenant isolation is enforced by `assertCompanyAccess` at
+    // the route level (server/src/routes/issues.ts, POST /issues/:id/comments).
+    return true;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -4583,7 +4607,8 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    // ANT-1076: comments are gated by company membership only.
+    if (!assertAgentIssueCommentAllowed(req, res, issue)) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,

@@ -499,7 +499,11 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
-  it("rejects non-assignee agent POST comments on closed issues", async () => {
+  // ANT-1076: non-assignee agent in same company may now POST a naked
+  // comment (no reopen/resume) even on a closed issue. Reopen path is still
+  // assignee-only — covered by "rejects explicit agent resume intent from a
+  // non-assignee".
+  it("allows non-assignee agent POST comments on closed issues without reopen", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
       id: "comment-1",
@@ -522,10 +526,11 @@ describe.sequential("issue comment reopen routes", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "hello" });
 
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(res.status).toBe(201);
+    // No reopen/resume → issue stays closed; assignee unchanged so
+    // shouldImplicitlyMoveCommentedIssueToTodo gate does not fire for a peer.
     expect(mockIssueService.update).not.toHaveBeenCalled();
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -975,7 +980,9 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: "restart someone else's work", resume: true });
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    // ANT-1076: comment gate is relaxed but resume/reopen still goes through
+    // assertExplicitResumeIntentAllowed for non-assignee agents.
+    expect(res.body.error).toBe("Agent cannot request follow-up for another agent's issue");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
