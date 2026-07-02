@@ -139,12 +139,23 @@ function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): s
   return `agent:${agentId}:${sessionKey}`;
 }
 
+function isoWeekKeyUtc(date: Date): string {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const isoYear = d.getUTCFullYear();
+  const yearStart = Date.UTC(isoYear, 0, 1);
+  const week = Math.ceil(((d.getTime() - yearStart) / 86400000 + 1) / 7);
+  return `${isoYear}-${String(week).padStart(2, "0")}`;
+}
+
 export function resolveSessionKey(input: {
   strategy: SessionKeyStrategy;
   configuredSessionKey: string | null;
   agentId: string | null;
   runId: string;
   issueId: string | null;
+  now?: Date;
 }): string {
   const fallback = input.configuredSessionKey ?? "paperclip";
   if (input.strategy === "run") {
@@ -153,7 +164,11 @@ export function resolveSessionKey(input: {
   if (input.strategy === "issue" && input.issueId) {
     return prefixSessionKeyForAgent(`${fallback}:issue:${input.issueId}`, input.agentId);
   }
-  return prefixSessionKeyForAgent(fallback, input.agentId);
+  // A bare fallback key accumulates unbounded history on the OpenClaw side
+  // (issueless heartbeat/coordination runs share it forever); a UTC ISO-week
+  // suffix caps each session at one week of traffic.
+  const bucketed = `${fallback}:w${isoWeekKeyUtc(input.now ?? new Date())}`;
+  return prefixSessionKeyForAgent(bucketed, input.agentId);
 }
 
 function isLoopbackHost(hostname: string): boolean {

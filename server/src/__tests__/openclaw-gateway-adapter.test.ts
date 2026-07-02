@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
-import { execute, testEnvironment } from "@paperclipai/adapter-openclaw-gateway/server";
+import { execute, resolveSessionKey, testEnvironment } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   buildOpenClawGatewayConfig,
   parseOpenClawGatewayStdoutLine,
@@ -665,6 +665,38 @@ describe("openclaw gateway ui build config", () => {
         },
       }),
     );
+  });
+});
+
+describe("openclaw gateway resolveSessionKey", () => {
+  const midYear = new Date(Date.UTC(2026, 6, 2)); // 2026-07-02, ISO week 27
+  const base = { configuredSessionKey: null, agentId: null, runId: "run-9", issueId: null, now: midYear };
+
+  it("uses per-run keys for the run strategy", () => {
+    expect(resolveSessionKey({ ...base, strategy: "run" })).toBe("paperclip:run:run-9");
+  });
+
+  it("uses per-issue keys when the issue strategy has an issueId", () => {
+    expect(resolveSessionKey({ ...base, strategy: "issue", issueId: "issue-7" })).toBe("paperclip:issue:issue-7");
+  });
+
+  it("time-buckets the fallback for issueless runs under the issue strategy", () => {
+    expect(resolveSessionKey({ ...base, strategy: "issue" })).toBe("paperclip:w2026-27");
+  });
+
+  it("time-buckets the fixed strategy and respects a configured key", () => {
+    expect(resolveSessionKey({ ...base, strategy: "fixed", configuredSessionKey: "custom" })).toBe("custom:w2026-27");
+  });
+
+  it("applies the agent prefix to bucketed fallback keys", () => {
+    expect(resolveSessionKey({ ...base, strategy: "fixed", agentId: "sigge" })).toBe("agent:sigge:paperclip:w2026-27");
+  });
+
+  it("handles ISO year boundaries in UTC", () => {
+    const w1of2025 = new Date(Date.UTC(2024, 11, 30)); // Mon 2024-12-30 -> ISO 2025-W01
+    const w53of2026 = new Date(Date.UTC(2027, 0, 1)); // Fri 2027-01-01 -> ISO 2026-W53
+    expect(resolveSessionKey({ ...base, strategy: "fixed", now: w1of2025 })).toBe("paperclip:w2025-01");
+    expect(resolveSessionKey({ ...base, strategy: "fixed", now: w53of2026 })).toBe("paperclip:w2026-53");
   });
 });
 
