@@ -1,2 +1,2 @@
-export { execute, resolveSessionKey } from "./execute.js";
+export { execute, resolveSessionKey, PROTOCOL_VERSION } from "./execute.js";
 export { testEnvironment } from "./test.js";

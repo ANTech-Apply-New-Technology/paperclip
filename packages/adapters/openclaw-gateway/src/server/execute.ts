@@ -86,7 +86,9 @@ type GatewayClientRequestOptions = {
   expectFinal?: boolean;
 };
 
-const PROTOCOL_VERSION = 3;
+// OpenClaw >=2026.5.28 gateways require protocol v4 and reject v3 handshakes
+// with `protocol-mismatch` (ws close 1002). See paperclipai/paperclip#8440.
+export const PROTOCOL_VERSION = 4;
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
@@ -1231,9 +1233,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
 
       if (stream === "assistant") {
-        const delta = nonEmpty(data.delta);
+        // Protocol v4 delta payloads carry `deltaText` (with `replace=true` for
+        // non-prefix replacements); v3 used `delta`.
+        const deltaText = nonEmpty(data.deltaText);
+        const delta = deltaText ?? nonEmpty(data.delta);
         const text = nonEmpty(data.text);
         if (delta) {
+          if (deltaText && data.replace === true) {
+            assistantChunks.length = 0;
+          }
           assistantChunks.push(delta);
         } else if (text) {
           assistantChunks.push(text);

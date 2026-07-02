@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
-import { execute, resolveSessionKey, testEnvironment } from "@paperclipai/adapter-openclaw-gateway/server";
+import { execute, PROTOCOL_VERSION, resolveSessionKey, testEnvironment } from "@paperclipai/adapter-openclaw-gateway/server";
 import {
   buildOpenClawGatewayConfig,
   parseOpenClawGatewayStdoutLine,
@@ -665,6 +665,13 @@ describe("openclaw gateway ui build config", () => {
         },
       }),
     );
+  });
+});
+
+describe("openclaw gateway protocol version", () => {
+  // OpenClaw >=2026.5.28 gateways reject v3 handshakes (protocol-mismatch, ws 1002).
+  it("negotiates gateway protocol v4 or higher", () => {
+    expect(PROTOCOL_VERSION).toBeGreaterThanOrEqual(4);
   });
 });
 
