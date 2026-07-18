@@ -70,3 +70,52 @@ Structured gateway event logs use:
 - `[openclaw-gateway:event] run=<id> stream=<stream> data=<json>` for `event agent` frames
 
 UI/CLI parsers consume these lines to render transcript updates.
+
+## Upstream Divergence: `agentParams.paperclip`
+
+> **⚠️ Warning — do not re-add `agentParams.paperclip`.**
+>
+> The OpenClaw Gateway server validates `agentParams` strictly: its `AgentParamsSchema`
+> uses `additionalProperties: false` (AJV, runtime 2026.4.11), so any unknown property
+> on `agentParams` causes the gateway to reject the request at validation time.
+>
+> The Antech fork therefore does **not** set `agentParams.paperclip` on the outgoing
+> agent request. This is permanent for the fork.
+
+### Background
+
+- **`4af590cf`** (Martin Bilger, 2026-04-22) — *“fix: remove paperclip property from
+  agentParams — openclaw rejects unknown props”* — removed the
+  `agentParams.paperclip = paperclipPayload` assignment in
+  `packages/adapters/openclaw-gateway/src/server/execute.ts`.
+- Upstream later added wake-payload batching logic (commit `91e040a6`) whose tests
+  assert that `agentParams.paperclip.wake = {...}` is present. Those assertions reflect
+  upstream behaviour and **do not apply to this fork**.
+- Sigge's investigation in **ANT-1000** re-confirmed that the gateway server still
+  rejects unknown `agentParams` properties on runtime `2026.4.11`, so the fork's
+  decision stands.
+
+Related issues:
+
+- **ANT-997** — Reconcile upstream-merge regression (root context).
+- **ANT-999** — Pipeline coordination follow-up.
+- **ANT-1000** — Gateway-server validation verification (closed: still strict).
+
+### Guidance for Future Upstream Merges
+
+When merging from upstream `openclaw/paperclip`:
+
+1. **Do not reintroduce `agentParams.paperclip`** in `src/server/execute.ts`. Wake
+   metadata reaches the agent via the `message` payload (and other already-allowed
+   fields), not via `agentParams`.
+2. Check the following test files and keep their assertions aligned with the fork
+   contract (no `agentParams.paperclip`, wake info carried in the message string):
+   - `server/src/__tests__/heartbeat-comment-wake-batching.test.ts`
+   - `server/src/__tests__/openclaw-gateway-adapter.test.ts`
+3. If upstream merge conflicts try to re-add the `paperclip` property or restore
+   `toMatchObject({ paperclip: { wake: ... } })` assertions, resolve them in favour
+   of the fork (omit the property, assert on `message`/wake fields the gateway
+   accepts).
+4. If a future gateway release relaxes `additionalProperties` (or adds an explicit
+   `paperclip` slot to `AgentParamsSchema`), re-open **ANT-997** and re-evaluate
+   before reverting `4af590cf`.
