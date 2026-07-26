@@ -13,6 +13,55 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * Structured reason codes for why a bearer token failed to resolve to an
+ * authenticated actor. ANT-1202: the ANT-1201 auth 401 flap left ZERO
+ * diagnostic signal because every rejection path fell through to next()
+ * silently, so the downstream guard emitted a bare "Agent authentication
+ * required" with no reason. These codes let us tell an intermittent store
+ * failure (`db_lookup_error`) apart from a genuinely bad/unknown/revoked key.
+ */
+export type AuthRejectReason =
+  | "no_bearer"
+  | "empty_token"
+  | "board_key_no_access"
+  | "unknown_agent_key"
+  | "agent_key_agent_missing"
+  | "agent_key_agent_terminated"
+  | "jwt_invalid"
+  | "jwt_agent_missing"
+  | "jwt_agent_company_mismatch"
+  | "jwt_agent_terminated"
+  | "session_resolve_error"
+  | "db_lookup_error";
+
+/**
+ * Emit a single structured line describing why a token was rejected. Never
+ * logs the raw token; only a short sha256 prefix so operators can correlate
+ * across requests without leaking credentials. Uses `warn` for failures that
+ * are operationally interesting (store errors / session resolution failures)
+ * and `debug` for expected negatives (unknown/anonymous callers).
+ */
+function logAuthReject(
+  req: Request,
+  reason: AuthRejectReason,
+  token?: string,
+  extra?: Record<string, unknown>,
+) {
+  const level: "warn" | "debug" =
+    reason === "db_lookup_error" || reason === "session_resolve_error" ? "warn" : "debug";
+  logger[level](
+    {
+      authReject: reason,
+      method: req.method,
+      url: req.originalUrl,
+      tokenHashPrefix: token ? hashToken(token).slice(0, 12) : undefined,
+      ...extra,
+    },
+    `auth reject: ${reason}`,
+  );
+}
+
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
@@ -52,10 +101,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         try {
           session = await opts.resolveSession(req);
         } catch (err) {
-          logger.warn(
-            { err, method: req.method, url: req.originalUrl },
-            "Failed to resolve auth session from request headers",
-          );
+          logAuthReject(req, "session_resolve_error", undefined, { err });
         }
         if (session?.user?.id) {
           const userId = session.user.id;
@@ -102,6 +148,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     const token = authHeader.slice("bearer ".length).trim();
     if (!token) {
+      logAuthReject(req, "empty_token");
       next();
       return;
     }
@@ -126,34 +173,61 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         next();
         return;
       }
+      logAuthReject(req, "board_key_no_access", token, { boardKeyId: boardKey.id });
     }
 
     const tokenHash = hashToken(token);
-    const key = await db
-      .select()
-      .from(agentApiKeys)
-      .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
-      .then((rows) => rows[0] ?? null);
+    let key: typeof agentApiKeys.$inferSelect | null;
+    try {
+      key = await db
+        .select()
+        .from(agentApiKeys)
+        .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
+        .then((rows) => rows[0] ?? null);
+    } catch (err) {
+      // Intermittent store failure (timeout / connection reset). Before ANT-1202
+      // this silently fell through to an anonymous actor -> downstream bare 401
+      // with no signal. Now we log the real reason. Behaviour is otherwise
+      // unchanged (still treated as unauthenticated for this request).
+      logAuthReject(req, "db_lookup_error", token, { stage: "agent_api_key_lookup", err });
+      next();
+      return;
+    }
 
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
+        logAuthReject(req, "unknown_agent_key", token);
         next();
         return;
       }
 
-      const agentRecord = await db
-        .select()
-        .from(agents)
-        .where(eq(agents.id, claims.sub))
-        .then((rows) => rows[0] ?? null);
+      let agentRecord: typeof agents.$inferSelect | null;
+      try {
+        agentRecord = await db
+          .select()
+          .from(agents)
+          .where(eq(agents.id, claims.sub))
+          .then((rows) => rows[0] ?? null);
+      } catch (err) {
+        logAuthReject(req, "db_lookup_error", token, { stage: "jwt_agent_lookup", agentId: claims.sub, err });
+        next();
+        return;
+      }
 
-      if (!agentRecord || agentRecord.companyId !== claims.company_id) {
+      if (!agentRecord) {
+        logAuthReject(req, "jwt_agent_missing", token, { agentId: claims.sub });
+        next();
+        return;
+      }
+      if (agentRecord.companyId !== claims.company_id) {
+        logAuthReject(req, "jwt_agent_company_mismatch", token, { agentId: claims.sub });
         next();
         return;
       }
 
       if (agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
+        logAuthReject(req, "jwt_agent_terminated", token, { agentId: claims.sub, agentStatus: agentRecord.status });
         next();
         return;
       }
@@ -170,18 +244,38 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    await db
-      .update(agentApiKeys)
-      .set({ lastUsedAt: new Date() })
-      .where(eq(agentApiKeys.id, key.id));
+    try {
+      await db
+        .update(agentApiKeys)
+        .set({ lastUsedAt: new Date() })
+        .where(eq(agentApiKeys.id, key.id));
+    } catch (err) {
+      // Best-effort last-used bookkeeping must never fail an otherwise valid
+      // key. Log and continue so a transient write hiccup does not manifest as
+      // a spurious 401.
+      logAuthReject(req, "db_lookup_error", token, { stage: "agent_api_key_touch", keyId: key.id, err });
+    }
 
-    const agentRecord = await db
-      .select()
-      .from(agents)
-      .where(eq(agents.id, key.agentId))
-      .then((rows) => rows[0] ?? null);
+    let agentRecord: typeof agents.$inferSelect | null;
+    try {
+      agentRecord = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, key.agentId))
+        .then((rows) => rows[0] ?? null);
+    } catch (err) {
+      logAuthReject(req, "db_lookup_error", token, { stage: "agent_key_agent_lookup", agentId: key.agentId, err });
+      next();
+      return;
+    }
 
-    if (!agentRecord || agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
+    if (!agentRecord) {
+      logAuthReject(req, "agent_key_agent_missing", token, { agentId: key.agentId });
+      next();
+      return;
+    }
+    if (agentRecord.status === "terminated" || agentRecord.status === "pending_approval") {
+      logAuthReject(req, "agent_key_agent_terminated", token, { agentId: key.agentId, agentStatus: agentRecord.status });
       next();
       return;
     }
