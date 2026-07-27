@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Request, RequestHandler } from "express";
+import type { Request, RequestHandler, Response } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
@@ -62,6 +62,46 @@ function logAuthReject(
   );
 }
 
+/**
+ * ANT-1204: Retry-After (seconds) advertised to agent clients when auth cannot
+ * be resolved because of a transient store failure (`db_lookup_error`). This is
+ * a *behaviour change* from the ANT-1202 observability-only work: a transient DB
+ * timeout during actor resolution used to degrade silently to an unauthenticated
+ * actor, producing a misleading downstream 401 ("Agent authentication required")
+ * that implies bad credentials. A valid client with a valid key must not be told
+ * its credentials are wrong when the real cause is a server-side DB blip, so we
+ * respond 503 + Retry-After to correctly signal "try again shortly".
+ *
+ * Backoff contract for agent clients:
+ * - 503 + `Retry-After: 2` means: retry the SAME request after ~2s (transient).
+ * - Clients SHOULD apply their own jittered exponential backoff on repeated 503s
+ *   (e.g. 2s, 4s, 8s ... capped) rather than hammering at a fixed 2s.
+ * - A 503 explicitly does NOT invalidate the credential; do not re-auth / rotate
+ *   keys on a 503 the way a client might reasonably react to a 401.
+ *
+ * Impact on existing clients that today retry on 401: previously a DB blip
+ * surfaced as 401, so any client that retried on 401 already recovered (by
+ * accident). Those clients will now see 503 for the same underlying condition.
+ * Clients that retry on 401 but NOT on 503 must be updated to honour 503 +
+ * Retry-After; clients that already treat 5xx as retryable improve immediately
+ * (they stop conflating transient outages with credential failures).
+ */
+const DB_LOOKUP_ERROR_RETRY_AFTER_SECONDS = 2;
+
+/**
+ * ANT-1204: Respond 503 + Retry-After for a transient actor-resolution store
+ * failure instead of silently falling through to an unauthenticated actor.
+ */
+function respondDbLookupUnavailable(res: Response): void {
+  res.setHeader("Retry-After", String(DB_LOOKUP_ERROR_RETRY_AFTER_SECONDS));
+  res.status(503).json({
+    error: "auth_store_unavailable",
+    message:
+      "Authentication temporarily unavailable due to a transient store error. Retry after the interval in the Retry-After header.",
+    retryAfterSeconds: DB_LOOKUP_ERROR_RETRY_AFTER_SECONDS,
+  });
+}
+
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
@@ -69,7 +109,7 @@ interface ActorMiddlewareOptions {
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -189,8 +229,12 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       // this silently fell through to an anonymous actor -> downstream bare 401
       // with no signal. Now we log the real reason. Behaviour is otherwise
       // unchanged (still treated as unauthenticated for this request).
+      // ANT-1204: transient store failure resolving the agent key. Behaviour
+      // change from ANT-1202 (which only logged then degraded to anonymous):
+      // respond 503 + Retry-After so a valid client is told to retry rather than
+      // seeing a misleading 401.
       logAuthReject(req, "db_lookup_error", token, { stage: "agent_api_key_lookup", err });
-      next();
+      respondDbLookupUnavailable(res);
       return;
     }
 
@@ -210,8 +254,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           .where(eq(agents.id, claims.sub))
           .then((rows) => rows[0] ?? null);
       } catch (err) {
+        // ANT-1204: transient store failure resolving the JWT agent record.
         logAuthReject(req, "db_lookup_error", token, { stage: "jwt_agent_lookup", agentId: claims.sub, err });
-        next();
+        respondDbLookupUnavailable(res);
         return;
       }
 
@@ -264,8 +309,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         .where(eq(agents.id, key.agentId))
         .then((rows) => rows[0] ?? null);
     } catch (err) {
+      // ANT-1204: transient store failure resolving the agent record behind a
+      // valid key.
       logAuthReject(req, "db_lookup_error", token, { stage: "agent_key_agent_lookup", agentId: key.agentId, err });
-      next();
+      respondDbLookupUnavailable(res);
       return;
     }
 
